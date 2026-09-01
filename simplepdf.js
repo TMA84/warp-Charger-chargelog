@@ -242,3 +242,7 @@ function parsePNG(data) {
 }
 
 module.exports = SimplePDF;
+module.exports.toWinAnsi = toWinAnsi;
+module.exports.escapePdf = escapePdf;
+module.exports.textWidth = textWidth;
+module.exports.parsePNG = parsePNG;

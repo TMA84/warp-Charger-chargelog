@@ -33,7 +33,7 @@ function discoverWallboxes(timeoutMs = 3000) {
     const bonjour = new Bonjour();
     const found = [];
     const browser = bonjour.find({ type: 'http' }, service => {
-      if (/^warp3?-/i.test(service.name)) {
+      if (/^warp\d*-/i.test(service.name)) {
         const addr = (service.addresses || []).find(a => !a.includes(':')) || service.host;
         found.push({ host: addr, name: service.name });
       }
@@ -124,7 +124,7 @@ let dataCache = null;
 let cacheTime = 0;
 const CACHE_TTL = 5 * 60 * 1000; // 5 Minuten
 
-async function fetchAllData(forceRefresh = false) {
+let fetchAllData = async function(forceRefresh = false) {
   if (!forceRefresh && dataCache && (Date.now() - cacheTime < CACHE_TTL)) {
     return dataCache;
   }
@@ -414,5 +414,17 @@ app.get('/pdf', async (req, res) => {
   res.end(buf);
 });
 
-const port = CONFIG.port || 3000;
-app.listen(port, () => console.log(`WARP3 Ladeabrechnung: http://localhost:${port}`));
+if (require.main === module) {
+  const port = CONFIG.port || 3000;
+  app.listen(port, () => console.log(`WARP3 Ladeabrechnung: http://localhost:${port}`));
+}
+
+module.exports = {
+  parseChargeLog, applyFilters, buildRows,
+  tsToDate, fmtDate, fmtDuration,
+  loadCompany, saveCompany, app,
+  // Exposed for testing: allows tests to override fetchAllData
+  get _fetchAllData() { return fetchAllData; },
+  set _fetchAllData(fn) { fetchAllData = fn; },
+  _resetCache() { dataCache = null; cachedHosts = null; },
+};

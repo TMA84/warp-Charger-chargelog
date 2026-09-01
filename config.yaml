@@ -20,3 +20,4 @@ image: ghcr.io/tma84/warp3-chargelog-{arch}
 webui: http://[HOST]:[PORT:8099]
 panel_icon: mdi:ev-station
 panel_title: Ladeabrechnung
+ingress: true
