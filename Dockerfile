@@ -4,7 +4,7 @@ RUN apk add --no-cache nodejs npm
 
 COPY package.json package-lock.json /app/
 RUN cd /app && npm ci --production
-COPY server.js simplepdf.js warp_logo.png /app/
+COPY server.js simplepdf.js pdffonts.js chargelogpdf.js warp_logo.png /app/
 COPY views/ /app/views/
 
 COPY entrypoint.sh /

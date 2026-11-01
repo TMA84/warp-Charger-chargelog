@@ -14,7 +14,7 @@ Home Assistant Add-on für konsolidierte Ladeabrechnung mehrerer [Tinkerforge WA
 - **Alle Ladevorgänge** von mehreren WARP3 Wallboxen konsolidiert
 - **Benutzer-, Monats- und Jahresfilter** – Auswahl wird sofort übernommen
 - **Strompreis** und **Benutzernamen** direkt aus der Wallbox-API
-- **PDF-Export** im Original-WARP3-Ladelog-Format (Layout aus dem [Firmware-Quellcode](https://github.com/Tinkerforge/esp32-firmware/blob/master/software/src/modules/charge_tracker/pdf_charge_log.cpp))
+- **PDF-Export** im aktuellen WARP-Ladelog-Design (Redesign der Firmware vom Oktober 2026, Layout aus dem [Firmware-Quellcode](https://github.com/Tinkerforge/esp32-firmware/blob/master/software/src/modules/charge_tracker/pdf_charge_log.cpp)) – mit Kennzahlen-Kacheln, Start/Ende, Wallbox, End-Zählerstand, Summenzeile sowie Übersichten nach Benutzer und Wallbox
 - **Briefkopf/Firmenadresse** über die Weboberfläche konfigurierbar
 - **Daten-Caching** – schnelle Seitenaufrufe, manuelles Aktualisieren möglich
 
@@ -43,6 +43,10 @@ wallboxes:
   - host: "warp3-AbCd"
   - host: "warp3-EfGh"
 
+# Optional: Zeitzone für Datumsanzeige und Filter (Standard: Europe/Berlin,
+# wie die Ortszeit der Wallboxen)
+timezone: "Europe/Berlin"
+
 # Firmenadresse (auch über Weboberfläche änderbar)
 company:
   name: "Musterfirma GmbH"
@@ -57,7 +61,7 @@ Nach dem Start ist die Weboberfläche erreichbar unter:
 → **http://\<home-assistant-ip\>:8099**
 
 1. **Filtern** – Benutzer, Jahr und Monat über die Dropdowns auswählen
-2. **PDF Export** – Erzeugt ein PDF im Original-WARP3-Format mit Logo, Briefkopf und Tabelle
+2. **PDF Export** – Erzeugt ein PDF im WARP-Ladelog-Design mit Logo, Briefkopf, Kennzahlen, Tabelle und Übersichten
 3. **⚙ Briefkopf** – Firmenadresse für den PDF-Header konfigurieren
 4. **↻ Aktualisieren** – Cache leeren und frische Daten von den Wallboxen holen
 
@@ -81,7 +85,7 @@ Nach dem Start ist die Weboberfläche erreichbar unter:
 ## Technische Details
 
 - **Node.js / Express** mit EJS-Templates
-- **Eigener PDF-Generator** (`simplepdf.js`) – minimaler Speicherverbrauch
+- **Eigener PDF-Generator** (`simplepdf.js`, Layout in `chargelogpdf.js`) – minimaler Speicherverbrauch
 - **mDNS-Discovery** via `bonjour-service` – findet WARP-Charger automatisch im LAN
 - **Host-Netzwerk** – erforderlich für mDNS-Discovery
 - **Persistente Konfiguration** unter `/addon_configs/warp3-chargelog/`

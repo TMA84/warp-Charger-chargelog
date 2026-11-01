@@ -2,7 +2,7 @@ const express = require('express');
 const fs = require('fs');
 const http = require('http');
 const yaml = require('js-yaml');
-const PDFDocument = require('./simplepdf');
+const { renderChargeLogPdf } = require('./chargelogpdf');
 const Bonjour = require('bonjour-service').Bonjour;
 
 const app = express();
@@ -167,13 +167,47 @@ function tsToDate(tsMin) {
   return tsMin ? new Date(tsMin * 60 * 1000) : null;
 }
 
+// The wallboxes store UTC timestamps and show them in their local time. All dates and
+// filter boundaries use this time zone (config option `timezone`, default Europe/Berlin).
+const TIMEZONE = CONFIG.timezone || 'Europe/Berlin';
+const tzFormat = new Intl.DateTimeFormat('en-GB', {
+  timeZone: TIMEZONE, hourCycle: 'h23',
+  year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+});
+
+// Wall clock time of d in TIMEZONE as { year, month, day, hour, minute } strings
+function localParts(d) {
+  const p = {};
+  for (const { type, value } of tzFormat.formatToParts(d)) p[type] = value;
+  return p;
+}
+
+// UTC offset of TIMEZONE at the given instant, in ms
+function tzOffsetMs(ms) {
+  const p = localParts(new Date(ms));
+  const wall = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute);
+  return wall - Math.floor(ms / 60000) * 60000;
+}
+
+// Minutes since epoch of local midnight y-m-d in TIMEZONE (month 1-based, overflow allowed)
+function localDayStartMin(y, m, d) {
+  const wall = Date.UTC(y, m - 1, d);
+  let ms = wall - tzOffsetMs(wall);
+  ms = wall - tzOffsetMs(ms); // second pass for days with a DST change
+  return ms / 60000;
+}
+
+// "YYYY-MM-DD" → local midnight in minutes; other formats are parsed by Date as before
+function dateInputStartMin(str, addDays = 0) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(str);
+  if (m) return localDayStartMin(+m[1], +m[2], +m[3] + addDays);
+  return new Date(str).getTime() / 60000 + addDays * 1440;
+}
+
 function fmtDate(d) {
   if (!d) return '–';
-  const dd = String(d.getUTCDate()).padStart(2, '0');
-  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const hh = String(d.getUTCHours()).padStart(2, '0');
-  const mi = String(d.getUTCMinutes()).padStart(2, '0');
-  return `${dd}.${mm}.${d.getUTCFullYear()} ${hh}:${mi}`;
+  const p = localParts(d);
+  return `${p.day}.${p.month}.${p.year} ${p.hour}:${p.minute}`;
 }
 
 function fmtDuration(s) {
@@ -191,21 +225,21 @@ function applyFilters(charges, userId, dateFrom, dateTo, month, year) {
   }
   if (month) {
     const [y, m] = month.split('-').map(Number);
-    const from = new Date(Date.UTC(y, m - 1, 1)).getTime() / 60000;
-    const to = new Date(Date.UTC(y, m, 1)).getTime() / 60000;
+    const from = localDayStartMin(y, m, 1);
+    const to = localDayStartMin(y, m + 1, 1);
     result = result.filter(c => c.tsMin >= from && c.tsMin < to);
   } else if (year) {
     const y = parseInt(year);
-    const from = new Date(Date.UTC(y, 0, 1)).getTime() / 60000;
-    const to = new Date(Date.UTC(y + 1, 0, 1)).getTime() / 60000;
+    const from = localDayStartMin(y, 1, 1);
+    const to = localDayStartMin(y + 1, 1, 1);
     result = result.filter(c => c.tsMin >= from && c.tsMin < to);
   } else {
     if (dateFrom) {
-      const ts = new Date(dateFrom).getTime() / 60000;
+      const ts = dateInputStartMin(dateFrom);
       result = result.filter(c => c.tsMin >= ts);
     }
     if (dateTo) {
-      const ts = new Date(dateTo).getTime() / 60000 + 1440;
+      const ts = dateInputStartMin(dateTo, 1);
       result = result.filter(c => c.tsMin < ts);
     }
   }
@@ -271,147 +305,205 @@ app.get('/refresh', (req, res) => {
   res.redirect(req.headers.referer || '/');
 });
 
+// ── PDF report (layout of the WARP firmware charge log) ─────────────
+
+// Number with German thousands and decimal separators, like format_number in the firmware.
+function fmtNum(value, decimals) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '-';
+  const [int, frac] = Math.abs(value).toFixed(decimals).split('.');
+  const sign = value < 0 && Number(Math.abs(value).toFixed(decimals)) !== 0 ? '-' : '';
+  return sign + int.replace(/\B(?=(\d{3})+(?!\d))/g, '.') + (frac ? ',' + frac : '');
+}
+
+function fmtDay(d) {
+  return fmtDate(d).slice(0, 10);
+}
+
+function chargeCostCents(c) {
+  return c.energy !== null && c.energy !== undefined ? Math.round(c.energy * c.price) : 0;
+}
+
+function addStats(stats, c) {
+  stats.charges++;
+  stats.duration += c.duration || 0;
+  if (c.energy !== null && c.energy !== undefined) stats.energy += c.energy;
+  stats.costCents += chargeCostCents(c);
+}
+
+function statsCells(name, s, showCost) {
+  const cells = [name, fmtNum(s.charges, 0), fmtDuration(s.duration), fmtNum(s.energy, 3)];
+  if (showCost) cells.push(fmtNum(s.costCents / 100, 2));
+  return cells;
+}
+
+// Period shown in the report: the filter, or first charge until today if no filter is set.
+function reportPeriod(query, charges, now) {
+  // Last day of a range: one minute before the exclusive end, like the firmware
+  const lastDay = endMin => fmtDay(tsToDate(endMin - 1));
+  if (query.month) {
+    const [y, m] = query.month.split('-').map(Number);
+    return `${fmtDay(tsToDate(localDayStartMin(y, m, 1)))} - ${lastDay(localDayStartMin(y, m + 1, 1))}`;
+  }
+  if (query.year) {
+    const y = parseInt(query.year);
+    return `${fmtDay(tsToDate(localDayStartMin(y, 1, 1)))} - ${lastDay(localDayStartMin(y + 1, 1, 1))}`;
+  }
+  const known = charges.filter(c => c.tsMin).map(c => c.tsMin);
+  const from = query.from ? fmtDay(tsToDate(dateInputStartMin(query.from)))
+    : known.length ? fmtDay(tsToDate(Math.min(...known))) : 'Aufzeichnungsbeginn';
+  const to = query.to ? lastDay(dateInputStartMin(query.to, 1)) : fmtDay(now);
+  return `${from} - ${to}`;
+}
+
+/**
+ * Collects all texts of the charge log PDF. Mirrors build_pdf_report in the WARP firmware
+ * (charge_tracker.cpp), extended to charges of several wallboxes.
+ */
+function buildReport(charges, userNames, query, company, now = new Date()) {
+  const userName = id => userNames[id] || `ID ${id}`;
+  const sorted = [...charges].sort((a, b) => a.tsMin - b.tsMin);
+  const wallboxes = [...new Set(sorted.map(c => c.wallbox))].sort((a, b) => a.localeCompare(b, 'de', { sensitivity: 'base' }));
+  const prices = [...new Set(sorted.map(c => c.price))].filter(p => p);
+  const showCost = prices.length > 0;
+  const priceText = prices.map(p => `${fmtNum(p, 2)} ct/kWh`).join(' / ');
+  const period = reportPeriod(query, sorted, now);
+
+  // Statistics
+  const total = { charges: 0, duration: 0, energy: 0, costCents: 0 };
+  const byUser = new Map(), byWallbox = new Map();
+  let unknownStart = 0, withoutMeter = false;
+  for (const c of sorted) {
+    addStats(total, c);
+    for (const [map, key] of [[byUser, userName(c.userId)], [byWallbox, c.wallbox]]) {
+      if (!map.has(key)) map.set(key, { charges: 0, duration: 0, energy: 0, costCents: 0 });
+      addStats(map.get(key), c);
+    }
+    if (!c.tsMin) unknownStart++;
+    if (c.energy === null || c.energy === undefined) withoutMeter = true;
+  }
+
+  // Users
+  const uid = query.user;
+  const usersText = (uid !== undefined && uid !== '') ? userName(parseInt(uid)) : 'Alle Benutzer';
+
+  const info = [
+    { label: 'Zeitraum', value: period, bold: true },
+    { label: wallboxes.length > 1 ? 'Geräte' : 'Gerät', value: wallboxes.join(', ') },
+    { label: 'Benutzer', value: usersText },
+  ];
+  if (showCost) info.push({ label: 'Strompreis', value: priceText });
+  info.push({ label: 'Erstellt am', value: fmtDate(now) });
+
+  const tiles = [
+    { label: 'Gesamtenergie', value: `${fmtNum(total.energy, 3)} kWh` },
+    { label: 'Ladevorgänge', value: fmtNum(total.charges, 0) },
+    showCost
+      ? { label: 'Gesamtkosten', value: `${fmtNum(total.costCents / 100, 2)} €` }
+      : { label: 'Gesamtladedauer', value: `${fmtDuration(total.duration)} h` },
+  ];
+
+  const rows = sorted.map(c => {
+    const valid = c.energy !== null && c.energy !== undefined;
+    const known = !!c.tsMin;
+    return {
+      start: known ? fmtDate(tsToDate(c.tsMin)) : 'unbekannt',
+      end: known ? fmtDate(tsToDate(c.tsMin + Math.floor((c.duration + 30) / 60))) : 'unbekannt',
+      user: userName(c.userId),
+      charger: c.wallbox,
+      duration: fmtDuration(c.duration),
+      meterStart: c.kwhStart !== null ? fmtNum(c.kwhStart, 3) : '-',
+      meterEnd: c.kwhStart !== null && valid ? fmtNum(c.kwhStart + c.energy, 3) : '-',
+      energy: valid ? fmtNum(c.energy, 3) : '-',
+      cost: valid ? fmtNum(chargeCostCents(c) / 100, 2) : '-',
+    };
+  });
+
+  // Subtotals, only shown if there is more than one user or wallbox
+  const byName = map => [...map.entries()]
+    .sort(([a], [b]) => a.localeCompare(b, 'de', { sensitivity: 'base' }))
+    .map(([name, s]) => statsCells(name, s, showCost));
+  const subtotalTables = [];
+  if (byUser.size > 1) {
+    subtotalTables.push({
+      title: 'Übersicht nach Benutzer',
+      header: ['Benutzer', 'Ladevorgänge', 'Ladedauer\n(h:mm:ss)', 'Energie\n(kWh)', 'Kosten\n(€)'],
+      rows: byName(byUser),
+    });
+  }
+  if (byWallbox.size > 1) {
+    subtotalTables.push({
+      title: 'Übersicht nach Wallbox',
+      header: ['Wallbox', 'Ladevorgänge', 'Ladedauer\n(h:mm:ss)', 'Energie\n(kWh)', 'Kosten\n(€)'],
+      rows: byName(byWallbox),
+    });
+  }
+
+  // Note
+  let note = wallboxes.length > 1
+    ? 'Dieser Bericht wurde automatisch aus den Ladelogs der oben genannten Geräte erstellt.'
+    : 'Dieser Bericht wurde automatisch aus dem Ladelog des oben genannten Geräts erstellt.';
+  note += ' Enthalten sind alle Ladevorgänge, die im angegebenen Zeitraum begonnen haben.';
+  note += ' Die Energiemengen wurden mit MID-konformen Stromzählern gemessen.';
+  note += ' Die Energie eines Ladevorgangs ergibt sich aus der Differenz der Zählerstände bei Ende und Start.';
+  if (showCost) {
+    note += prices.length > 1
+      ? ` Die Kosten wurden mit den in den Wallboxen konfigurierten Strompreisen (${priceText}) berechnet.`
+      : ` Die Kosten wurden mit dem konfigurierten Strompreis von ${priceText} berechnet.`;
+  }
+  if (unknownStart === 1) {
+    note += ' Bei einem Ladevorgang ist die Startzeit unbekannt, da die Uhr des Geräts zu diesem Zeitpunkt nicht synchronisiert war.';
+  } else if (unknownStart > 1) {
+    note += ` Bei ${unknownStart} Ladevorgängen ist die Startzeit unbekannt, da die Uhr des Geräts zu diesem Zeitpunkt nicht synchronisiert war.`;
+  }
+  if (withoutMeter) {
+    note += ' Für mindestens einen Ladevorgang liegen keine gültigen Zählerstände vor. Die Summen sind daher unvollständig.';
+  }
+
+  const letterhead = [company.name, company.street, company.city].filter(Boolean);
+
+  return {
+    docTitle: 'WARP Ladelog',
+    title: 'Ladelog',
+    subtitle: 'Ladenachweis der erfassten Ladevorgänge',
+    period,
+    letterhead,
+    info,
+    tiles,
+    sectionTitle: 'Erfasste Ladevorgänge',
+    showCost,
+    tableHeader: ['Nr.', 'Start\nEnde', 'Benutzer\nWallbox', 'Ladedauer\n(h:mm:ss)',
+      'Start-Zählerstand\nEnd-Zählerstand', 'Energie\n(kWh)', 'Kosten\n(€)'],
+    rows,
+    noChargesText: 'Im ausgewählten Zeitraum wurden keine Ladevorgänge erfasst.',
+    totals: {
+      label: 'Summe',
+      duration: fmtDuration(total.duration),
+      energy: fmtNum(total.energy, 3),
+      cost: fmtNum(total.costCents / 100, 2),
+    },
+    subtotalTables,
+    noteTitle: 'Hinweis',
+    note,
+    footer: `Ladelog · ${wallboxes.join(', ')} · ${CONFIG.name || 'WARP3 Ladeabrechnung'} ${CONFIG.version || ''}`.trim(),
+    pageLabelFormat: 'Seite %d von %d',
+  };
+}
+
 app.get('/pdf', async (req, res) => {
-  const { charges, userNames, prices } = await fetchAllData();
+  const { charges, userNames } = await fetchAllData();
   const filtered = applyFilters(charges, req.query.user, req.query.from, req.query.to, req.query.month, req.query.year);
 
   if (!filtered.length) return res.status(404).send('Keine Ladevorgänge gefunden');
 
-  const priceCt = filtered[0].price;
-  const company = loadCompany();
-  const uid = req.query.user;
-  const userLabel = (uid !== undefined && uid !== '') ? (userNames[parseInt(uid)] || `ID ${uid}`) : 'Alle Benutzer';
-  const totalKwh = filtered.reduce((s, c) => s + (c.energy || 0), 0);
-  const totalCost = filtered.reduce((s, c) => s + (c.energy ? Math.round(c.energy * c.price) : 0), 0) / 100;
-  const multiWb = new Set(filtered.map(c => c.wallbox)).size > 1;
-  const wbNames = [...new Set(filtered.map(c => c.wallbox))].join(', ');
   const now = new Date();
-  const de = (n, d) => n.toFixed(d).replace('.', ',');
+  const report = buildReport(filtered, userNames, req.query, loadCompany(), now);
+  const { buffer } = renderChargeLogPdf(report);
 
-  let periodFrom, periodTo;
-  if (req.query.month) {
-    const [y, m] = req.query.month.split('-').map(Number);
-    periodFrom = fmtDate(new Date(Date.UTC(y, m - 1, 1)));
-    periodTo = fmtDate(new Date(Date.UTC(y, m, 1)));
-  } else {
-    periodFrom = req.query.from ? fmtDate(new Date(req.query.from)) : 'Aufzeichnungsbeginn';
-    periodTo = req.query.to ? fmtDate(new Date(req.query.to)) : 'Aufzeichnungsende';
-  }
-
-  // Layout constants from original WARP3 firmware (pdf_charge_log.cpp)
-  const PH = 841.89, ML = 42.5, MLH = 70.9, MR = 28.3, MT = 99.2, MB = 28.3;
-  const LW = 595.28 - ML - MR;
-  const FS = 9, LH = 13;
-  const colUnit = LW / 6;
-  const colX = [0, 0.8, 3.4, 4.125, 4.75, 5.575].map(f => ML + f * colUnit);
-  const colW = [];
-  for (let i = 0; i < 6; i++) colW.push((i < 5 ? colX[i+1] : ML + LW) - colX[i]);
-  // For multi-wallbox: redistribute columns more evenly
-  if (multiWb) {
-    const ML = 42.5, LW = 524.5;
-    const ws = [88, 78, 72, 68, 82, 62, 74]; // 7 columns = 524
-    let x = ML;
-    colX.length = 0; colW.length = 0;
-    for (const w of ws) { colX.push(x); colW.push(w); x += w; }
-  }
-
-  const hdrs = multiWb
-    ? ['Startzeit', 'Benutzer', 'Wallbox', 'Zählerstand Start', 'geladen (kWh)', 'Ladedauer', 'Kosten (€)']
-    : ['Startzeit', 'Benutzer', 'Zählerstand Start', 'geladen (kWh)', 'Ladedauer', 'Kosten (€)'];
-  const PAD = 6;
-  const rightCols = multiWb ? new Set([3, 4, 5, 6]) : new Set([2, 3, 4, 5]);
-
-  const ROWS_FIRST = 32, ROWS_PER = 40;
-  const totalPages = filtered.length <= ROWS_FIRST ? 1 : 1 + Math.ceil((filtered.length - ROWS_FIRST) / ROWS_PER);
-
-  const pdf = new PDFDocument();
-  const path = require('path');
-  const logoId = pdf.addImage(path.join(__dirname, 'warp_logo.png'));
-  let pageNum = 0;
-  let tableY;
-
-  function newPage(isFirst) {
-    pdf.addPage();
-    pageNum++;
-    // Grey header bar + logo (from original: rect 0,24 full-width h=75, logo at 42.5,43)
-    pdf.rect(0, 24.2, 595.28, 75, 0x545454);
-    pdf.drawImage(logoId, 42.5, 43, 300, 39);
-    // Page number bottom center
-    pdf.text(`Seite ${pageNum} von ${totalPages}`, 595.28 / 2 - 30, PH - MB, { size: FS });
-
-    if (isFirst) {
-      // Stats (right column area) – original position: column 3 of 6-col layout
-      const sx = ML + 3.4 * (LW / 6); // 339.7pt from original
-      const startY = MT + 10 + LH * 2; // 135.2pt – matches original
-      let sy = startY;
-      const stats = [
-        `Wallbox: ${wbNames}`,
-        `Exportiert am: ${fmtDate(now)}`,
-        `Exportierte Benutzer: ${userLabel}`,
-        `Exportierter Zeitraum: ${periodFrom} bis ${periodTo}`,
-        `Gesamtenergie exportierter Ladevorgänge: ${de(totalKwh, 3)} kWh`,
-      ];
-      if (priceCt) stats.push(`Gesamtkosten: ${de(totalCost, 2)}€ (${de(priceCt, 2)} ct/kWh)`);
-      for (const line of stats) { pdf.text(line, sx, sy, { size: FS }); sy += LH; }
-
-      // Letterhead (left)
-      if (company.name) {
-        let ly = startY;
-        pdf.text(company.name, MLH, ly, { size: FS, bold: true }); ly += LH;
-        if (company.street) { pdf.text(company.street, MLH, ly, { size: FS }); ly += LH; }
-        if (company.city) { pdf.text(company.city, MLH, ly, { size: FS }); ly += LH; }
-      }
-
-      const headerRows = Math.max(company.name ? 3 : 0, stats.length);
-      tableY = startY + (headerRows + 2) * LH;
-    } else {
-      tableY = MT + 10;
-    }
-
-    // Table header
-    hdrs.forEach((h, i) => {
-      if (rightCols.has(i)) pdf.textRight(h, colX[i], tableY, colW[i] - PAD, { size: FS, bold: true });
-      else pdf.text(h, colX[i], tableY, { size: FS, bold: true });
-    });
-    pdf.line(ML, tableY + FS - 4, ML + LW, tableY + FS - 4);
-    tableY += LH + 4;
-  }
-
-  newPage(true);
-  const maxY = PH - MB - LH * 2;
-
-  filtered.sort((a, b) => a.tsMin - b.tsMin);
-
-  for (const c of filtered) {
-    if (tableY > maxY) newPage(false);
-
-    const dt = tsToDate(c.tsMin);
-    const cost = c.energy ? Math.round(c.energy * c.price) / 100 : 0;
-    const vals = [
-      fmtDate(dt),
-      userNames[c.userId] || `ID ${c.userId}`,
-    ];
-    if (multiWb) vals.push(c.wallbox);
-    vals.push(
-      c.kwhStart !== null ? de(c.kwhStart, 3) : '-',
-      c.energy !== null ? de(c.energy, 3) : '-',
-      fmtDuration(c.duration),
-      de(cost, 2),
-    );
-
-    vals.forEach((v, i) => {
-      if (rightCols.has(i)) pdf.textRight(v, colX[i], tableY, colW[i] - PAD, { size: FS });
-      else pdf.text(v, colX[i], tableY, { size: FS });
-    });
-    tableY += LH * 1.2;
-  }
-
-  const buf = pdf.toBuffer();
   const filename = `Ladelog-${now.toISOString().slice(0, 16).replace(/:/g, '-')}.pdf`;
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-  res.setHeader('Content-Length', buf.length);
-  res.end(buf);
+  res.setHeader('Content-Length', buffer.length);
+  res.end(buffer);
 });
 
 if (require.main === module) {
@@ -421,7 +513,7 @@ if (require.main === module) {
 
 module.exports = {
   parseChargeLog, applyFilters, buildRows,
-  tsToDate, fmtDate, fmtDuration,
+  tsToDate, fmtDate, fmtDuration, fmtNum, buildReport, localDayStartMin, TIMEZONE,
   loadCompany, saveCompany, app,
   // Exposed for testing: allows tests to override fetchAllData
   get _fetchAllData() { return fetchAllData; },

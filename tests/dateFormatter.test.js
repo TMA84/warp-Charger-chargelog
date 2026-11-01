@@ -21,15 +21,21 @@ describe('fmtDate – Unit Tests', () => {
     expect(fmtDate(null)).toBe('–');
   });
 
-  it('known date → expected string', () => {
+  it('known date → local time Europe/Berlin (CET, UTC+1)', () => {
     // 2024-03-15 14:30 UTC
     const d = new Date(Date.UTC(2024, 2, 15, 14, 30));
-    expect(fmtDate(d)).toBe('15.03.2024 14:30');
+    expect(fmtDate(d)).toBe('15.03.2024 15:30');
   });
 
-  it('epoch start → "01.01.1970 00:00"', () => {
+  it('summer time → CEST (UTC+2), matches the wallbox export', () => {
+    // Charge from the warp4-8798 export: 08.09.2026 14:46 on the wallbox
+    const d = new Date(Date.UTC(2026, 8, 8, 12, 46));
+    expect(fmtDate(d)).toBe('08.09.2026 14:46');
+  });
+
+  it('epoch start → "01.01.1970 01:00"', () => {
     const d = new Date(0);
-    expect(fmtDate(d)).toBe('01.01.1970 00:00');
+    expect(fmtDate(d)).toBe('01.01.1970 01:00');
   });
 });
 

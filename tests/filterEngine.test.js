@@ -1,4 +1,4 @@
-const { applyFilters } = require('../server');
+const { applyFilters, fmtDate, tsToDate, localDayStartMin } = require('../server');
 const fc = require('fast-check');
 const { arbFilterParams } = require('./helpers');
 
@@ -17,6 +17,39 @@ function makeCharge(tsMin, userId, extra = {}) {
 
 // Helpers for minute-based timestamps
 const utcMinutes = (y, m, d) => new Date(Date.UTC(y, m, d)).getTime() / 60000;
+
+// Local (Europe/Berlin) calendar day of a charge as "YYYY-MM-DD", derived from fmtDate
+const localDay = c => {
+  const [dd, mm, yyyy] = fmtDate(tsToDate(c.tsMin)).slice(0, 10).split('.');
+  return `${yyyy}-${mm}-${dd}`;
+};
+
+describe('applyFilters – Europe/Berlin boundaries', () => {
+  it('localDayStartMin handles CET and CEST', () => {
+    expect(localDayStartMin(2026, 1, 1)).toBe(Date.UTC(2025, 11, 31, 23) / 60000);
+    expect(localDayStartMin(2026, 9, 1)).toBe(Date.UTC(2026, 7, 31, 22) / 60000);
+    // DST change days: 29.03.2026 starts in CET, 25.10.2026 starts in CEST
+    expect(localDayStartMin(2026, 3, 29)).toBe(Date.UTC(2026, 2, 28, 23) / 60000);
+    expect(localDayStartMin(2026, 10, 25)).toBe(Date.UTC(2026, 9, 24, 22) / 60000);
+    // month overflow
+    expect(localDayStartMin(2026, 13, 1)).toBe(localDayStartMin(2027, 1, 1));
+  });
+
+  it('month filter uses local midnight, not UTC midnight', () => {
+    const lateAug = makeCharge(Date.UTC(2026, 7, 31, 22, 30) / 60000, 1); // 01.09. 00:30 local
+    const lateSep = makeCharge(Date.UTC(2026, 8, 30, 22, 30) / 60000, 1); // 01.10. 00:30 local
+    const result = applyFilters([lateAug, lateSep], null, null, null, '2026-09', null);
+    expect(result).toEqual([lateAug]);
+  });
+
+  it('date range covers whole local days', () => {
+    const early = makeCharge(Date.UTC(2026, 8, 9, 22, 15) / 60000, 1); // 10.09. 00:15 local
+    const late = makeCharge(Date.UTC(2026, 8, 10, 21, 59) / 60000, 1); // 10.09. 23:59 local
+    const next = makeCharge(Date.UTC(2026, 8, 10, 22, 0) / 60000, 1);  // 11.09. 00:00 local
+    const result = applyFilters([early, late, next], null, '2026-09-10', '2026-09-10', null, null);
+    expect(result).toEqual([early, late]);
+  });
+});
 
 // ─── 4.1 Unit Tests ─────────────────────────────────────────────────────────
 
@@ -143,7 +176,7 @@ describe('applyFilters – Property Tests', () => {
 
   /**
    * Property 7: Month filter correctness
-   * All returned records have tsMin in UTC range [monthStart, nextMonthStart).
+   * All returned records start in that month (local time), no record of that month is dropped.
    *
    * **Validates: Requirements 2.3**
    */
@@ -157,10 +190,9 @@ describe('applyFilters – Property Tests', () => {
           const monthStr = `${y}-${String(m).padStart(2, '0')}`;
           const result = applyFilters(charges, null, null, null, monthStr, null);
 
-          const from = new Date(Date.UTC(y, m - 1, 1)).getTime() / 60000;
-          const to = new Date(Date.UTC(y, m, 1)).getTime() / 60000;
-
-          expect(result.every(c => c.tsMin >= from && c.tsMin < to)).toBe(true);
+          const inMonth = c => localDay(c).startsWith(monthStr + '-');
+          expect(result.every(inMonth)).toBe(true);
+          expect(result).toHaveLength(charges.filter(inMonth).length);
         }
       ),
       { numRuns: 100 }
@@ -169,7 +201,7 @@ describe('applyFilters – Property Tests', () => {
 
   /**
    * Property 8: Year filter correctness
-   * All returned records have tsMin in UTC range [yearStart, nextYearStart).
+   * All returned records start in that year (local time), no record of that year is dropped.
    *
    * **Validates: Requirements 2.4**
    */
@@ -180,11 +212,9 @@ describe('applyFilters – Property Tests', () => {
         fc.integer({ min: 2020, max: 2030 }).map(String),
         (charges, yearStr) => {
           const result = applyFilters(charges, null, null, null, null, yearStr);
-          const y = parseInt(yearStr);
-          const from = new Date(Date.UTC(y, 0, 1)).getTime() / 60000;
-          const to = new Date(Date.UTC(y + 1, 0, 1)).getTime() / 60000;
-
-          expect(result.every(c => c.tsMin >= from && c.tsMin < to)).toBe(true);
+          const inYear = c => localDay(c).startsWith(yearStr + '-');
+          expect(result.every(inYear)).toBe(true);
+          expect(result).toHaveLength(charges.filter(inYear).length);
         }
       ),
       { numRuns: 100 }
@@ -193,7 +223,7 @@ describe('applyFilters – Property Tests', () => {
 
   /**
    * Property 9: Date range filter correctness
-   * All returned records satisfy tsMin >= dateFrom and tsMin < dateTo + 1440.
+   * Exactly the records whose local start day lies in [dateFrom, dateTo] are returned.
    *
    * **Validates: Requirements 2.6, 2.7**
    */
@@ -217,10 +247,9 @@ describe('applyFilters – Property Tests', () => {
 
           const result = applyFilters(charges, null, dateFrom, dateTo, null, null);
 
-          const fromTs = new Date(dateFrom).getTime() / 60000;
-          const toTs = new Date(dateTo).getTime() / 60000 + 1440;
-
-          expect(result.every(c => c.tsMin >= fromTs && c.tsMin < toTs)).toBe(true);
+          const inRange = c => localDay(c) >= dateFrom && localDay(c) <= dateTo;
+          expect(result.every(inRange)).toBe(true);
+          expect(result).toHaveLength(charges.filter(inRange).length);
         }
       ),
       { numRuns: 100 }
