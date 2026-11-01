@@ -1,6 +1,6 @@
 name: WARP3 Ladeabrechnung
 description: Konsolidierte Ladeabrechnung für Tinkerforge WARP3 Wallboxen
-version: "1.0.10"
+version: "1.0.11"
 slug: warp3-chargelog
 url: https://github.com/TMA84/warp3-chargelog
 arch:
