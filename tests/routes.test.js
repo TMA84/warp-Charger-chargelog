@@ -136,13 +136,32 @@ describe('Express Routes Integration Tests', () => {
 
   // ── GET /refresh → cache reset, redirect ──────────────────────────
   // Requirements: 9.6
-  it('GET /refresh resets cache and redirects to referer', async () => {
-    const res = await request(app)
-      .get('/refresh')
-      .set('Referer', 'http://localhost:3000/?user=1');
+  it('GET /refresh resets cache and keeps the filters', async () => {
+    const res = await request(app).get('/refresh?user=1&month=2026-04');
 
     expect(res.status).toBe(302);
-    expect(res.headers.location).toBe('http://localhost:3000/?user=1');
+    expect(res.headers.location).toBe('/?user=1&month=2026-04');
+  });
+
+  // ── Home Assistant ingress: redirects stay inside the add-on ──────
+  it('redirects keep the ingress prefix (X-Ingress-Path)', async () => {
+    const ingress = '/api/hassio_ingress/abc123';
+    const refresh = await request(app).get('/refresh?user=1').set('X-Ingress-Path', ingress);
+    expect(refresh.headers.location).toBe(ingress + '/?user=1');
+
+    const company = await request(app)
+      .post('/company?year=2026')
+      .set('X-Ingress-Path', ingress)
+      .type('form')
+      .send({ name: 'Test GmbH', street: '', city: '' });
+    expect(company.headers.location).toBe(ingress + '/?year=2026');
+  });
+
+  it('page uses only relative URLs (works behind ingress)', async () => {
+    const res = await request(app).get('/');
+    expect(res.text).not.toMatch(/(href|action)="\//);
+    expect(res.text).not.toMatch(/location\.href = '\//);
+    expect(res.text).toContain('id="results"');
   });
 
   it('GET /refresh without referer redirects to /', async () => {

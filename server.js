@@ -294,15 +294,23 @@ app.get('/', async (req, res) => {
   }
 });
 
+// Start page including the Home Assistant ingress prefix, keeping the current filters.
+// Behind ingress the add-on is served under /api/hassio_ingress/<token>/ (header X-Ingress-Path).
+function homeUrl(req) {
+  const ingress = String(req.headers['x-ingress-path'] || '').replace(/\/+$/, '');
+  const query = new URLSearchParams(req.query).toString();
+  return `${ingress}/${query ? '?' + query : ''}`;
+}
+
 app.post('/company', (req, res) => {
   saveCompany({ name: req.body.name || '', street: req.body.street || '', city: req.body.city || '' });
-  res.redirect('/');
+  res.redirect(homeUrl(req));
 });
 
 app.get('/refresh', (req, res) => {
   dataCache = null;
   cachedHosts = null;
-  res.redirect(req.headers.referer || '/');
+  res.redirect(homeUrl(req));
 });
 
 // ── PDF report (layout of the WARP firmware charge log) ─────────────

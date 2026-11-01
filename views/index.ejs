@@ -45,7 +45,7 @@
     <div class="header">
         <h1>WARP3 Ladeabrechnung</h1>
         <div class="header-actions">
-            <a href="/refresh" class="btn btn-outline">Aktualisieren</a>
+            <a href="refresh" class="btn btn-outline" onclick="this.href = 'refresh?' + buildParams().toString()">Aktualisieren</a>
             <button class="btn btn-outline" onclick="document.querySelector('.company-panel').style.display=document.querySelector('.company-panel').style.display==='flex'?'none':'flex'">Briefkopf</button>
         </div>
     </div>
@@ -54,7 +54,7 @@
     <div class="error">Fehler beim Abrufen der Wallbox-Daten: <%= error %></div>
     <% } %>
 
-    <form class="card company-panel" method="post" action="/company">
+    <form class="card company-panel" method="post" action="company" onsubmit="this.action = 'company?' + buildParams().toString()">
         <div class="field">
             <label>Firma</label>
             <input name="name" value="<%= company.name %>" style="width:250px">
@@ -111,6 +111,7 @@
         <button type="button" class="btn btn-success" onclick="downloadPdf()">PDF exportieren</button>
     </div>
 
+    <div id="results">
     <% if (rows.length > 0) { %>
     <div class="stats">
         <div class="card stat-card"><div class="value"><%= rows.length %></div><div class="label">Ladevorgänge</div></div>
@@ -152,6 +153,7 @@
     <% } else if (!error) { %>
     <div class="card"><p class="empty">Keine Ladevorgänge für die gewählten Filter gefunden.</p></div>
     <% } %>
+    </div>
 </div>
 
 <script>
@@ -169,8 +171,34 @@ function buildParams() {
     if (to) p.set('to', to);
     return p;
 }
-function applyFilters() { window.location.href = '/?' + buildParams().toString(); }
-function downloadPdf() { window.location.href = '/pdf?' + buildParams().toString(); }
+// All URLs are relative: behind Home Assistant ingress the add-on lives under
+// /api/hassio_ingress/<token>/, an absolute "/" would load Home Assistant itself.
+let filterRequest = 0;
+async function applyFilters() {
+    const query = buildParams().toString();
+    const url = './' + (query ? '?' + query : '');
+    const results = document.getElementById('results');
+    const id = ++filterRequest;
+    results.style.opacity = '0.5';
+    try {
+        const res = await fetch(url, { credentials: 'same-origin' });
+        const html = await res.text();
+        if (id !== filterRequest) return; // a newer filter change is pending
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const fresh = doc.getElementById('results');
+        if (!res.ok || !fresh) throw new Error('HTTP ' + res.status);
+        results.replaceWith(fresh);
+        history.replaceState(null, '', url);
+    } catch (e) {
+        window.location.href = url; // fallback: normal navigation
+    } finally {
+        if (id === filterRequest) {
+            const el = document.getElementById('results');
+            if (el) el.style.opacity = '';
+        }
+    }
+}
+function downloadPdf() { window.location.href = 'pdf?' + buildParams().toString(); }
 </script>
 </body>
 </html>
